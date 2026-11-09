@@ -201,6 +201,7 @@ int main(int argc, char **argv) {
     int window = !(getenv("DM_LAUNCHER") && !strcmp(getenv("DM_LAUNCHER"), "0"));
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--no-launcher")) window = 0;
     if (!window) fprintf(stderr, "launcher: no settings window (DM_LAUNCHER=0 or --no-launcher)\n");
+    snprintf(p, sizeof p, "%s/playtime.json", sup); setenv("DM_PLAYTIME_FILE", p, 0);   // local addition: dm/host/front_mac.m counts, Launcher.swift shows the total
     int shown = window ? dm_mac_launcher() : 2;
     if (!shown) return 0;   // Quit: no game
     if (shown == 2) saved_choices();
