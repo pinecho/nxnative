@@ -1573,6 +1573,7 @@ static NSArray<NSURL *> *found_cheat_files(NSString *build) {
 }
 @end
 
+static void playtime_start(NSMenu *app);   // the playtime counter (below the progress screen): a local addition
 void front_run(void (*guest)(void)) {
     // A game: tell macOS its work is latency-critical, so the system does not trade its frame time for power while the frame rate is capped
     static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
@@ -1614,6 +1615,7 @@ void front_run(void (*guest)(void)) {
         NSMenu *bar = [NSMenu new], *app = [NSMenu new], *wm = [[NSMenu alloc] initWithTitle:@"Window"];
         [[bar addItemWithTitle:@"" action:nil keyEquivalent:@""] setSubmenu:app];
         [app addItemWithTitle:[@"Quit " stringByAppendingString:@(DM_GAME_NAME)] action:@selector(terminate:) keyEquivalent:@"q"];
+        playtime_start(app);   // its row goes above Quit
         // Cheats (hle_cheats.c): the rows rebuild on every open through the delegate, the same rows the file reload changes
         g_cheats_menu = [DmCheatsMenuDelegate new];
         NSMenu *cm = [[NSMenu alloc] initWithTitle:@"Cheats"];
@@ -1699,6 +1701,78 @@ void front_run(void (*guest)(void)) {
 
 // Progress screen of the prepare step (front.h front_progress): a dark view over the game's, the title, a bar and a count, centered; AppKit views, so it draws while the game's thread waits
 static NSView *g_prog; static NSTextField *g_prog_title, *g_prog_count; static NSProgressIndicator *g_prog_bar;
+
+// ---- Playtime: a local addition on this Mac (branch local/oot-playtime), not in nxnative upstream ----
+// The time the game's window is in front after its first frame, like Screen Time: paused while another app is in front,
+// the window is minimized, the progress screen is up or the screen sleeps. Kept in DM_PLAYTIME_FILE (launcher.c:
+// <DM_ROOT>/playtime.json) as {"schema": 1, "seconds": …}, the file MacNativeGames' Mac apps keep, written every 15 s of
+// new time, when the window leaves the front and at exit. Shown in the window title and the app menu's first row
+// (this session and the total); Launcher.swift shows the total. A file that is not a playtime file is left as it is.
+static NSString *g_pt_path, *g_pt_name; static NSMutableDictionary *g_pt_rec; static NSMenuItem *g_pt_item;
+static double g_pt_total, g_pt_saved, g_pt_session, g_pt_last; static int g_pt_has, g_pt_on, g_pt_asleep, g_pt_writable = 1;
+static int pt_zh(void) {
+    const char *l = getenv("DM_LANG");
+    if (l && *l) return !strncmp(l, "zh", 2);
+    return [NSLocale.preferredLanguages.firstObject hasPrefix:@"zh"];
+}
+static NSString *pt_hm(double s, int zh) {
+    unsigned long long m = (unsigned long long)(s / 60);
+    return [NSString stringWithFormat:zh ? @"%llu 小时 %02llu 分" : @"%llu h %02llu min", m / 60, m % 60];
+}
+static NSString *pt_text(void) {
+    int zh = pt_zh();
+    NSString *s = [NSString stringWithFormat:zh ? @"本次 %@" : @"Session %@", pt_hm(g_pt_session, zh)];
+    if (!g_pt_writable) return [s stringByAppendingString:zh ? @" · 总计不可用" : @" · total unavailable"];
+    return [s stringByAppendingFormat:zh ? @" · 总计 %@" : @" · total %@", pt_hm(g_pt_total, zh)];
+}
+static void pt_save(void) {
+    if (!g_pt_writable || g_pt_total == g_pt_saved) return;
+    g_pt_rec[@"schema"] = @1; g_pt_rec[@"seconds"] = @(g_pt_total);
+    NSError *e = nil;
+    NSData *d = [NSJSONSerialization dataWithJSONObject:g_pt_rec options:NSJSONWritingPrettyPrinted error:&e];
+    if (d && [d writeToFile:g_pt_path options:NSDataWritingAtomic error:&e]) g_pt_saved = g_pt_total;
+    else LOG("playtime: could not write %s: %s", g_pt_path.UTF8String, e.localizedDescription.UTF8String);
+}
+static void pt_tick(int stopping) {   // the main thread, once a second
+    double now = CACurrentMediaTime(); NSWindow *w = g_win;
+    int on = !stopping && !g_pt_asleep && NSApp.isActive && w.isKeyWindow && !w.miniaturized && !g_prog && dm_guest_frame() > 0;
+    double dt = now - g_pt_last;
+    if (g_pt_has && g_pt_on && dt > 0 && dt <= 5) { g_pt_session += dt; if (g_pt_writable) g_pt_total += dt; }
+    int stopped = g_pt_on && !on;
+    g_pt_last = now; g_pt_has = 1; g_pt_on = on;
+    if (stopped || g_pt_total - g_pt_saved >= 15) pt_save();
+    NSString *t = pt_text(), *title = [NSString stringWithFormat:@"%@ — %@", g_pt_name, t];
+    if (g_pt_item && ![g_pt_item.title isEqualToString:t]) g_pt_item.title = t;
+    if (w && ![w.title isEqualToString:title]) w.title = title;
+}
+static void pt_exit(void) { if ([NSThread isMainThread]) pt_tick(1); else pt_save(); }   // ⌘Q, the window closing, the game ending
+static void playtime_start(NSMenu *app) {
+    g_pt_name = @(DM_GAME_NAME);
+    const char *f = getenv("DM_PLAYTIME_FILE"), *root = getenv("DM_ROOT");
+    g_pt_path = f && *f ? @(f) : root && *root ? [@(root) stringByAppendingPathComponent:@"playtime.json"] : nil;
+    g_pt_rec = [NSMutableDictionary new];
+    if (!g_pt_path) g_pt_writable = 0;   // a development run without DM_ROOT: this session only
+    else if ([NSFileManager.defaultManager fileExistsAtPath:g_pt_path]) {
+        NSData *d = [NSData dataWithContentsOfFile:g_pt_path];
+        id o = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+        id v = [o isKindOfClass:NSDictionary.class] ? o[@"seconds"] : nil;
+        if (![v isKindOfClass:NSNumber.class] || !isfinite([v doubleValue]) || [v doubleValue] < 0 || [v doubleValue] > 1e12) {
+            g_pt_writable = 0; LOG("playtime: %s is not a playtime file; left as it is", g_pt_path.UTF8String);
+        } else { g_pt_rec = [o mutableCopy]; g_pt_total = [v doubleValue]; }
+    }
+    g_pt_saved = g_pt_total;
+    g_pt_item = [[NSMenuItem alloc] initWithTitle:pt_text() action:nil keyEquivalent:@""]; g_pt_item.enabled = NO;
+    [app insertItem:g_pt_item atIndex:0]; [app insertItem:NSMenuItem.separatorItem atIndex:1];
+    NSTimer *t = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *x) { (void)x; pt_tick(0); }];
+    [NSRunLoop.mainRunLoop addTimer:t forMode:NSRunLoopCommonModes];
+    NSNotificationCenter *ws = NSWorkspace.sharedWorkspace.notificationCenter;
+    for (NSNotificationName n in @[NSWorkspaceWillSleepNotification, NSWorkspaceScreensDidSleepNotification, NSWorkspaceSessionDidResignActiveNotification])
+        [ws addObserverForName:n object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *x) { (void)x; pt_tick(1); g_pt_asleep = 1; }];
+    for (NSNotificationName n in @[NSWorkspaceDidWakeNotification, NSWorkspaceScreensDidWakeNotification, NSWorkspaceSessionDidBecomeActiveNotification])
+        [ws addObserverForName:n object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *x) { (void)x; g_pt_asleep = 0; g_pt_last = CACurrentMediaTime(); }];
+    atexit(pt_exit);
+    LOG("playtime: %s, %.0f s so far", g_pt_path ? g_pt_path.UTF8String : "this session only", g_pt_total);
+}
 static NSTextField *prog_label(NSRect r, CGFloat size, NSFontWeight w, NSColor *c) {
     NSTextField *t = [NSTextField labelWithString:@""]; t.frame = r; t.alignment = NSTextAlignmentCenter; t.textColor = c;
     t.font = [NSFont monospacedDigitSystemFontOfSize:size weight:w]; return t;

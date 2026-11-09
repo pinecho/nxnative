@@ -117,6 +117,17 @@ enum SaveCheck {
     }
 }
 
+// The total playtime (a local addition): DM_PLAYTIME_FILE, which launcher.c sets and dm/host/front_mac.m keeps
+private func playtimeTotal() -> String? {
+    // getenv, not ProcessInfo.environment: launcher.c sets DM_PLAYTIME_FILE in this process before the window
+    guard let p = getenv("DM_PLAYTIME_FILE"), let data = FileManager.default.contents(atPath: String(cString: p)),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let s = (obj["seconds"] as? NSNumber)?.doubleValue, s.isFinite, s >= 0 else { return nil }
+    let m = Int(s / 60), mm = String(format: "%02d", m % 60)
+    let zh = (info("DMLanguage") ?? Locale.preferredLanguages.first ?? "").hasPrefix("zh")
+    return zh ? "游玩时长 \(m / 60) 小时 \(mm) 分" : "Played \(m / 60) h \(mm) min"
+}
+
 struct LauncherView: View {
     @ObservedObject var m: LauncherModel
     let done: (Bool) -> Void
@@ -133,6 +144,7 @@ struct LauncherView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(info("CFBundleName") ?? "Game").font(.title2.weight(.semibold))
                     Text("Version \(info("CFBundleShortVersionString") ?? "1.0")").foregroundStyle(.secondary)
+                    if let played = playtimeTotal() { Text(played).foregroundStyle(.secondary) }
                 }
                 Spacer()
             }
